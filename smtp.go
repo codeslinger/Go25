@@ -9,7 +9,7 @@ import (
 
 // --- SMTP Service ---------------------------------------------------------
 
-var DefaultIdent = "Go25 ESMTP"
+var DefaultIdent = "ESMTP Go25"
 
 type SMTPService struct {
   ServerIdent   string
@@ -65,7 +65,7 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     return
   }
   for {
-    err = session.HandleCommand()
+    err = session.Process()
     if err != nil {
       if err != SessionClosedByClient {
         log.Error("%s: failed to read command: %v", conn.RemoteAddr(), err)
