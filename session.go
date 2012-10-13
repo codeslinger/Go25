@@ -21,7 +21,6 @@ type SMTPSession struct {
   client   io.ReadWriter
   input    []byte
   state    sessionState
-  encoding bodyEncoding
   ident    *string
   domain   *string
 }
@@ -36,13 +35,6 @@ const (
   rcptReceived
   dataReceived
   bodyReceived
-)
-
-type bodyEncoding int
-
-const (
-  mime7bit = iota
-  mime8bit
 )
 
 var (
@@ -62,6 +54,7 @@ var (
   InvalidSentinel       = errors.New("line not terminated with CRLF")
   InvalidCommand        = errors.New("invalid SMTP command")
   InvalidArgument       = errors.New("SMTP command requested should have no arguments")
+  MessageTooLong        = errors.New("Message body was over maximum size allowed")
   ReadInterrupted       = errors.New("read from client interrupted")
   SessionClosedByClient = errors.New("session terminated by client")
   TimeoutError          = errors.New("session timed out")
@@ -99,12 +92,11 @@ func NewSMTPSession(client io.ReadWriter,
   return &SMTPSession{
     Remote:   remoteAddr,
     From:     "",
-    Rcpts:    make([]string, InitialRcptsLen),
+    Rcpts:    make([]string, 0),
     Body:     "",
     client:   client,
     input:    make([]byte, InputBufSize),
     state:    connected,
-    encoding: mime7bit,
     ident:    ident,
     domain:   domain,
   }
@@ -117,29 +109,23 @@ func (s *SMTPSession) R(code int) (err error) {
 }
 
 // Greet a newly-connected SMTP client with the initial banner message.
-// Will send a 421 error response if the server is in the process of shutting
-// down when the client connects.
 func (s *SMTPSession) Greet(shutdown bool) error {
-  if shutdown {
-    s.R(421)
-    return InShutdown
-  }
   s.state = bannerSent
   return s.respond(220, s.banner())
 }
 
 // TODO: make this pipelining-safe
 // Read, process and respond to a SMTP command(s) from the client.
-func (s *SMTPSession) Process() error {
+func (s *SMTPSession) Process() (Verdict, error) {
   size, err := s.readLine()
   if err != nil {
     if err == LineTooLong || err == InvalidSentinel {
-      return s.R(500)
+      return Continue, s.R(500)
     }
-    return s.R(554)
+    return Continue, s.R(554)
   }
   if size < MinCommandLength {
-    return s.R(500)
+    return Continue, s.R(500)
   }
   // I know, I know... its gross but its fast
   if s.input[0] == 'A' || s.input[0] == 'a' {
@@ -180,7 +166,7 @@ func (s *SMTPSession) Process() error {
     }
   } else if s.input[0] == 'M' || s.input[0] == 'm' {
     if size < MinMailLineLength {
-      return s.R(500)
+      return Continue, s.R(500)
     }
     if (s.input[1] == 'A' || s.input[1] == 'a') &&
        (s.input[2] == 'I' || s.input[2] == 'i') &&
@@ -209,7 +195,7 @@ func (s *SMTPSession) Process() error {
   } else if s.input[0] == 'R' || s.input[0] == 'r' {
     if s.input[1] == 'C' || s.input[1] == 'c' {
       if size < MinRcptLineLength {
-        return s.R(500)
+        return Continue, s.R(500)
       }
       if (s.input[2] == 'P' || s.input[2] == 'p') &&
          (s.input[3] == 'T' || s.input[3] == 't') &&
@@ -227,7 +213,7 @@ func (s *SMTPSession) Process() error {
     }
   } else if s.input[0] == 'S' || s.input[0] == 's' {
     if size < MinMailLineLength {
-      return s.R(500)
+      return Continue, s.R(500)
     }
     if s.input[1] == 'E' || s.input[1] == 'e' {
       if (s.input[2] == 'N' || s.input[2] == 'n') &&
@@ -263,7 +249,6 @@ func (s *SMTPSession) Process() error {
         return s.handleSoml(size)
       }
     }
-
   } else if s.input[0] == 'V' || s.input[0] == 'v' {
     if (s.input[1] == 'R' || s.input[1] == 'r') &&
        (s.input[2] == 'F' || s.input[2] == 'f') &&
@@ -271,32 +256,38 @@ func (s *SMTPSession) Process() error {
       return s.handleVrfy(size)
     }
   }
-  return s.R(500)
+  return Continue, s.R(500)
 }
 
 // Process an AUTH command.
-func (s *SMTPSession) handleAuth(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleAuth(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a DATA command.
-func (s *SMTPSession) handleData(size int) error {
+func (s *SMTPSession) handleData(size int) (Verdict, error) {
   if len(s.Rcpts) < 1 {
-    return s.respond(554, "no valid recipients given")
+    return Continue, s.respond(554, "no valid recipients given")
   }
   err := s.R(354)
   if err != nil {
-    return err
+    return Terminate, err
   }
   s.state = dataReceived
-  // TODO: read message body here, looking for <CRLF>.<CRLF> sentinel
-  return nil
+  err = s.readBody()
+  if err != nil {
+    return Continue, err
+  }
+  return Continue, s.R(250)
 }
 
 // Process an EHLO command.
-func (s *SMTPSession) handleEhlo(size int) error {
+func (s *SMTPSession) handleEhlo(size int) (Verdict, error) {
+  if s.state > bannerSent {
+    return Continue, s.R(503)
+  }
   s.state = heloReceived
-  return s.respondMulti(
+  return Continue, s.respondMulti(
     250,
     []string{s.heloLine(),
              fmt.Sprintf("SIZE %d", MaxMsgSize),
@@ -305,100 +296,102 @@ func (s *SMTPSession) handleEhlo(size int) error {
 }
 
 // Process an ETRN command.
-func (s *SMTPSession) handleEtrn(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleEtrn(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process an EXPN command.
-func (s *SMTPSession) handleExpn(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleExpn(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a HELO command.
-func (s *SMTPSession) handleHelo(size int) error {
+func (s *SMTPSession) handleHelo(size int) (Verdict, error) {
+  if s.state > bannerSent {
+    return Continue, s.R(503)
+  }
   s.state = heloReceived
-  return s.respond(250, s.heloLine())
+  return Continue, s.respond(250, s.heloLine())
 }
 
 // Process a HELP command.
-func (s *SMTPSession) handleHelp(size int) error {
-  return s.R(214)
+func (s *SMTPSession) handleHelp(size int) (Verdict, error) {
+  return Continue, s.R(214)
 }
 
 // Process a MAIL FROM command.
-func (s *SMTPSession) handleMail(size int) error {
+func (s *SMTPSession) handleMail(size int) (Verdict, error) {
   if s.state != heloReceived {
-    return s.R(503)
+    return Continue, s.R(503)
   }
   from, err := s.extractAddress(0, size)
   if err != nil {
-    return s.R(501)
+    return Terminate, s.R(501)
   }
   s.From = from
   s.state = mailReceived
-  return s.R(250)
+  return Continue, s.R(250)
 }
 
 // Process a NOOP command.
-func (s *SMTPSession) handleNoop(size int) error {
-  return s.R(250)
+func (s *SMTPSession) handleNoop(size int) (Verdict, error) {
+  return Continue, s.R(250)
 }
 
 // Process a QUIT command.
-func (s *SMTPSession) handleQuit(size int) error {
+func (s *SMTPSession) handleQuit(size int) (Verdict, error) {
   err := s.R(221)
-  if err != nil {
-    return err
-  }
-  return SessionClosedByClient
+  return Terminate, err
 }
 
 // Process a RCPT TO command.
-func (s *SMTPSession) handleRcpt(size int) error {
+func (s *SMTPSession) handleRcpt(size int) (Verdict, error) {
   if s.state != mailReceived && s.state != rcptReceived {
-    return s.R(503)
+    return Continue, s.R(503)
   }
   rcpt, err := s.extractAddress(0, size)
   if err != nil {
-    return s.R(501)
+    return Continue, s.R(501)
   }
-  s.appendRcpt(rcpt)
+  s.Rcpts = append(s.Rcpts, rcpt)
   s.state = rcptReceived
-  return s.R(250)
+  return Continue, s.R(250)
 }
 
 // Process a RSET command.
-func (s *SMTPSession) handleRset(size int) error {
+func (s *SMTPSession) handleRset(size int) (Verdict, error) {
   if s.state >= heloReceived {
     s.state = heloReceived
-    s.encoding = mime7bit
+    s.From = ""
+    s.Rcpts = make([]string, 0)
+    s.Body = ""
   }
-  return s.R(250)
+  return Continue, s.R(250)
 }
 
 // Process a SEND FROM command.
-func (s *SMTPSession) handleSend(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleSend(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a SAML FROM command.
-func (s *SMTPSession) handleSaml(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleSaml(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a SOML FROM command.
-func (s *SMTPSession) handleSoml(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleSoml(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a TURN command.
-func (s *SMTPSession) handleTurn(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleTurn(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Process a VRFY command.
-func (s *SMTPSession) handleVrfy(size int) error {
-  return s.R(502)
+func (s *SMTPSession) handleVrfy(size int) (Verdict, error) {
+  return Continue, s.R(502)
 }
 
 // Format SMTP response line with code and message.
@@ -451,6 +444,32 @@ func (s *SMTPSession) readLine() (int, error) {
   return -1, ReadInterrupted
 }
 
+// Read in the <CRLF>.<CRLF>-terminated body of an SMTP message submission.
+func (s *SMTPSession) readBody() error {
+  // TODO: spill message to disk if its over a certain size
+  body := make([]byte, MaxMsgSize)
+  pos := 0
+  for {
+    n, err := s.client.Read(body[pos:])
+    if err != nil {
+      return err
+    }
+    pos += n
+    if body[pos-1] == '\n' &&
+       body[pos-2] == '\r' &&
+       body[pos-3] == '.'  &&
+       body[pos-4] == '\n' &&
+       body[pos-5] == '\r' {
+      break
+    }
+    if pos >= MaxMsgSize {
+      return MessageTooLong
+    }
+  }
+  s.Body = string(body[0:pos-5])
+  return nil
+}
+
 // Extract the email address part of an SMTP command line that should
 // contain one (i.e. the stuff between the < and > in MAIL/RCPT commands).
 func (s *SMTPSession) extractAddress(begin, size int) (string, error) {
@@ -463,7 +482,7 @@ func (s *SMTPSession) extractAddress(begin, size int) (string, error) {
     }
   }
   if start > -1 && end > -1 && end > start {
-    return string(s.input[start:end]), nil
+    return string(s.input[start+1:end]), nil
   }
   return "", AddressNotFound
 }
@@ -479,17 +498,5 @@ func (s *SMTPSession) banner() string {
 // Format line for greeting clients in response to HELO/EHLO command.
 func (s *SMTPSession) heloLine() string {
   return fmt.Sprintf("%s Hello [%s]", *s.domain, s.Remote.IP)
-}
-
-// Append a new RCPT TO address to the list of recipients for the current 
-// message.
-func (s *SMTPSession) appendRcpt(rcpt string) {
-  l := len(s.Rcpts)
-  if l + 1 > cap(s.Rcpts) {
-    newRcpts := make([]string, l * 2)
-    copy(newRcpts, s.Rcpts)
-    s.Rcpts = newRcpts
-  }
-  s.Rcpts[l] = rcpt
 }
 

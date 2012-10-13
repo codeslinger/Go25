@@ -19,6 +19,13 @@ type SMTPService struct {
   draining      bool
 }
 
+type Verdict int
+
+const (
+  Continue = iota
+  Terminate
+)
+
 // Create a new SMTP server instance bound to the given TCP address.
 func NewSMTPService(addr, domain string) *SMTPService {
   return &SMTPService{
@@ -55,6 +62,12 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     conn.Close()
   }()
 
+  // Send a 421 error response if the server is in the process of shutting
+  // down when the client connects.
+  if s.draining {
+    conn.Write(ResponseMap[421])
+    return
+  }
   session := NewSMTPSession(conn,
                             conn.RemoteAddr().(*net.TCPAddr),
                             &s.ServerIdent,
@@ -65,11 +78,12 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     return
   }
   for {
-    err = session.Process()
+    verdict, err := session.Process()
+    if verdict == Terminate {
+      return
+    }
     if err != nil {
-      if err != SessionClosedByClient {
-        log.Error("%s: failed to read command: %v", conn.RemoteAddr(), err)
-      }
+      log.Error("%s: failed to read command: %v", conn.RemoteAddr(), err)
       return
     }
   }
