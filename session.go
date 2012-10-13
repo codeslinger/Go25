@@ -278,6 +278,7 @@ func (s *SMTPSession) handleData(size int) (Verdict, error) {
   if err != nil {
     return Continue, err
   }
+  s.state = bodyReceived
   return Continue, s.R(250)
 }
 
