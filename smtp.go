@@ -62,28 +62,22 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     conn.Close()
   }()
 
+  // Send a 421 error response if the server is in the process of shutting
+  // down when the client connects.
+  if s.draining {
+    conn.Write(ResponseMap[421])
+    return
+  }
   session := NewSMTPSession(conn,
                             conn.RemoteAddr().(*net.TCPAddr),
                             &s.ServerIdent,
                             &s.ServingDomain)
-  // Send a 421 error response if the server is in the process of shutting
-  // down when the client connects.
-  if s.draining {
-    session.R(421)
-    return
-  }
-  err := session.Greet(s.draining)
-  if err != nil {
-    log.Error("%s: failed to send greeting banner: %v", conn.RemoteAddr(), err)
+  if verdict := session.Greet(); verdict == Terminate {
     return
   }
   for {
-    verdict, err := session.Process()
-    if verdict == Terminate {
+    if verdict := session.Process(); verdict == Terminate {
       return
-    }
-    if err != nil {
-      log.Error("%s: failed to read command: %v", conn.RemoteAddr(), err)
     }
   }
 }

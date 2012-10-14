@@ -2,6 +2,7 @@
 package main
 
 import (
+  "bufio"
   "errors"
   "fmt"
   "github.com/codeslinger/log"
@@ -13,9 +14,9 @@ import (
 // --- SMTP Session ---------------------------------------------------------
 
 type SMTPSession struct {
+  r        *bufio.Reader
+  w        io.Writer
   remote   *net.TCPAddr
-  client   io.ReadWriter
-  input    []byte
   state    sessionState
   ident    *string
   domain   *string
@@ -40,7 +41,6 @@ var (
   MinCommandLength  = 6
   MinMailLineLength = 14
   MinRcptLineLength = 12
-  InputBufSize      = 2048
 )
 
 var (
@@ -83,9 +83,9 @@ func NewSMTPSession(client io.ReadWriter,
                     remoteAddr *net.TCPAddr,
                     ident, domain *string) *SMTPSession {
   return &SMTPSession{
+    r:        bufio.NewReaderSize(client, MaxLineLength),
+    w:        client,
     remote:   remoteAddr,
-    client:   client,
-    input:    make([]byte, InputBufSize),
     state:    connected,
     ident:    ident,
     domain:   domain,
@@ -93,307 +93,323 @@ func NewSMTPSession(client io.ReadWriter,
   }
 }
 
-// Write a single-line response from the ResponseMap for the given code.
-func (s *SMTPSession) R(code int) (err error) {
-  _, err = s.client.Write(ResponseMap[code])
-  return
-}
-
 // Greet a newly-connected SMTP client with the initial banner message.
-func (s *SMTPSession) Greet(shutdown bool) error {
+func (s *SMTPSession) Greet() Verdict {
   s.state = bannerSent
-  return s.respond(220, s.banner())
+  return s.respondWithVerdict(220, s.banner())
 }
 
-// TODO: make this pipelining-safe
 // Read, process and respond to a SMTP command(s) from the client.
-func (s *SMTPSession) Process() (Verdict, error) {
-  size, err := s.readLine()
+func (s *SMTPSession) Process() Verdict {
+  data, err := s.r.ReadBytes('\n')
   if err != nil {
-    if err == LineTooLong || err == InvalidSentinel {
-      return Continue, s.R(500)
-    }
-    return Continue, s.R(554)
+    s.codeWithVerdict(500)
+    return Terminate
   }
-  if size < MinCommandLength {
-    return Continue, s.R(500)
+  if len(data) < MinCommandLength {
+    return s.codeWithVerdict(500)
   }
   // I know, I know... its gross but its fast
-  if s.input[0] == 'A' || s.input[0] == 'a' {
-    if (s.input[1] == 'U' || s.input[1] == 'u') &&
-       (s.input[2] == 'T' || s.input[2] == 't') &&
-       (s.input[3] == 'H' || s.input[3] == 'h') &&
-       s.input[4] == ' ' {
-      return s.handleAuth(size)
+  if data[0] == 'A' || data[0] == 'a' {
+    if (data[1] == 'U' || data[1] == 'u') &&
+       (data[2] == 'T' || data[2] == 't') &&
+       (data[3] == 'H' || data[3] == 'h') &&
+       data[4] == ' ' {
+      return s.handleAuth(data)
     }
-  } else if s.input[0] == 'D' || s.input[0] == 'd' {
-    if (s.input[1] == 'A' || s.input[1] == 'a') &&
-       (s.input[2] == 'T' || s.input[2] == 't') &&
-       (s.input[3] == 'A' || s.input[3] == 'a') {
-      return s.handleData(size)
+  } else if data[0] == 'D' || data[0] == 'd' {
+    if (data[1] == 'A' || data[1] == 'a') &&
+       (data[2] == 'T' || data[2] == 't') &&
+       (data[3] == 'A' || data[3] == 'a') {
+      return s.handleData(data)
     }
-  } else if s.input[0] == 'E' || s.input[0] == 'e' {
-    if s.input[1] == 'H' || s.input[1] == 'h' {
-      if (s.input[2] == 'L' || s.input[2] == 'l') &&
-         (s.input[3] == 'O' || s.input[3] == 'o') &&
-         s.input[4] == ' ' {
-        return s.handleEhlo(size)
+  } else if data[0] == 'E' || data[0] == 'e' {
+    if data[1] == 'H' || data[1] == 'h' {
+      if (data[2] == 'L' || data[2] == 'l') &&
+         (data[3] == 'O' || data[3] == 'o') &&
+         data[4] == ' ' {
+        return s.handleEhlo(data)
       }
-    } else if s.input[1] == 'X' || s.input[1] == 'x' {
-      if (s.input[2] == 'P' || s.input[2] == 'p') &&
-         (s.input[3] == 'N' || s.input[3] == 'n') &&
-         s.input[4] == ' ' {
-        return s.handleExpn(size)
-      }
-    }
-  } else if s.input[0] == 'H' || s.input[0] == 'h' {
-    if (s.input[1] == 'E' || s.input[1] == 'e') &&
-       (s.input[2] == 'L' || s.input[2] == 'l') {
-      if (s.input[3] == 'O' || s.input[3] == 'o') && s.input[4] == ' ' {
-        return s.handleHelo(size)
-      } else if s.input[3] == 'P' || s.input[3] == 'p' {
-        return s.handleHelp(size)
+    } else if data[1] == 'X' || data[1] == 'x' {
+      if (data[2] == 'P' || data[2] == 'p') &&
+         (data[3] == 'N' || data[3] == 'n') &&
+         data[4] == ' ' {
+        return s.handleExpn(data)
       }
     }
-  } else if s.input[0] == 'M' || s.input[0] == 'm' {
-    if size < MinMailLineLength {
-      return Continue, s.R(500)
-    }
-    if (s.input[1] == 'A' || s.input[1] == 'a') &&
-       (s.input[2] == 'I' || s.input[2] == 'i') &&
-       (s.input[3] == 'L' || s.input[3] == 'l') &&
-       s.input[4] == ' ' &&
-       (s.input[5] == 'F' || s.input[5] == 'f') &&
-       (s.input[6] == 'R' || s.input[6] == 'r') &&
-       (s.input[7] == 'O' || s.input[7] == 'o') &&
-       (s.input[8] == 'M' || s.input[8] == 'm') &&
-       s.input[9] == ':' {
-      return s.handleMail(size)
-    }
-    log.Trace(string(s.input))
-  } else if s.input[0] == 'N' || s.input[0] == 'n' {
-    if (s.input[1] == 'O' || s.input[1] == 'o') &&
-       (s.input[2] == 'O' || s.input[2] == 'o') &&
-       (s.input[3] == 'P' || s.input[3] == 'p') {
-      return s.handleNoop(size)
-    }
-  } else if s.input[0] == 'Q' || s.input[0] == 'q' {
-    if (s.input[1] == 'U' || s.input[1] == 'u') &&
-       (s.input[2] == 'I' || s.input[2] == 'i') &&
-       (s.input[3] == 'T' || s.input[3] == 't') {
-      return s.handleQuit(size)
-    }
-  } else if s.input[0] == 'R' || s.input[0] == 'r' {
-    if s.input[1] == 'C' || s.input[1] == 'c' {
-      if size < MinRcptLineLength {
-        return Continue, s.R(500)
-      }
-      if (s.input[2] == 'P' || s.input[2] == 'p') &&
-         (s.input[3] == 'T' || s.input[3] == 't') &&
-         s.input[4] == ' ' &&
-         (s.input[5] == 'T' || s.input[5] == 't') &&
-         (s.input[6] == 'O' || s.input[6] == 'o') &&
-         s.input[7] == ':' {
-        return s.handleRcpt(size)
-      }
-    } else if s.input[1] == 'S' || s.input[1] == 's' {
-      if (s.input[2] == 'E' || s.input[2] == 'e') &&
-         (s.input[3] == 'T' || s.input[3] == 't') {
-        return s.handleRset(size)
+  } else if data[0] == 'H' || data[0] == 'h' {
+    if (data[1] == 'E' || data[1] == 'e') &&
+       (data[2] == 'L' || data[2] == 'l') {
+      if (data[3] == 'O' || data[3] == 'o') &&
+         data[4] == ' ' {
+        return s.handleHelo(data)
+      } else if data[3] == 'P' || data[3] == 'p' {
+        return s.handleHelp(data)
       }
     }
-  } else if s.input[0] == 'S' || s.input[0] == 's' {
-    if size < MinMailLineLength {
-      return Continue, s.R(500)
+  } else if data[0] == 'M' || data[0] == 'm' {
+    if len(data) < MinMailLineLength {
+      return s.codeWithVerdict(500)
     }
-    if s.input[1] == 'E' || s.input[1] == 'e' {
-      if (s.input[2] == 'N' || s.input[2] == 'n') &&
-         (s.input[3] == 'D' || s.input[3] == 'd') &&
-         s.input[4] == ' ' &&
-         (s.input[5] == 'F' || s.input[5] == 'f') &&
-         (s.input[6] == 'R' || s.input[6] == 'r') &&
-         (s.input[7] == 'O' || s.input[7] == 'o') &&
-         (s.input[8] == 'M' || s.input[8] == 'm') &&
-         s.input[9] == ':' {
-        return s.handleSend(size)
+    if (data[1] == 'A' || data[1] == 'a') &&
+       (data[2] == 'I' || data[2] == 'i') &&
+       (data[3] == 'L' || data[3] == 'l') &&
+       data[4] == ' ' &&
+       (data[5] == 'F' || data[5] == 'f') &&
+       (data[6] == 'R' || data[6] == 'r') &&
+       (data[7] == 'O' || data[7] == 'o') &&
+       (data[8] == 'M' || data[8] == 'm') &&
+       data[9] == ':' {
+      return s.handleMail(data)
+    }
+  } else if data[0] == 'N' || data[0] == 'n' {
+    if (data[1] == 'O' || data[1] == 'o') &&
+       (data[2] == 'O' || data[2] == 'o') &&
+       (data[3] == 'P' || data[3] == 'p') {
+      return s.handleNoop(data)
+    }
+  } else if data[0] == 'Q' || data[0] == 'q' {
+    if (data[1] == 'U' || data[1] == 'u') &&
+       (data[2] == 'I' || data[2] == 'i') &&
+       (data[3] == 'T' || data[3] == 't') {
+      return s.handleQuit(data)
+    }
+  } else if data[0] == 'R' || data[0] == 'r' {
+    if data[1] == 'C' || data[1] == 'c' {
+      if len(data) < MinRcptLineLength {
+        return s.codeWithVerdict(500)
       }
-    } else if s.input[1] == 'A' || s.input[1] == 'a' {
-      if (s.input[2] == 'M' || s.input[2] == 'm') &&
-         (s.input[3] == 'L' || s.input[3] == 'l') &&
-         s.input[4] == ' ' &&
-         (s.input[5] == 'F' || s.input[5] == 'f') &&
-         (s.input[6] == 'R' || s.input[6] == 'r') &&
-         (s.input[7] == 'O' || s.input[7] == 'o') &&
-         (s.input[8] == 'M' || s.input[8] == 'm') &&
-         s.input[9] == ':' {
-        return s.handleSaml(size)
+      if (data[2] == 'P' || data[2] == 'p') &&
+         (data[3] == 'T' || data[3] == 't') &&
+         data[4] == ' ' &&
+         (data[5] == 'T' || data[5] == 't') &&
+         (data[6] == 'O' || data[6] == 'o') &&
+         data[7] == ':' {
+        return s.handleRcpt(data)
       }
-    } else if s.input[1] == 'O' || s.input[1] == 'o' {
-      if (s.input[2] == 'M' || s.input[2] == 'm') &&
-         (s.input[3] == 'L' || s.input[3] == 'l') &&
-         s.input[4] == ' ' &&
-         (s.input[5] == 'F' || s.input[5] == 'f') &&
-         (s.input[6] == 'R' || s.input[6] == 'r') &&
-         (s.input[7] == 'O' || s.input[7] == 'o') &&
-         (s.input[8] == 'M' || s.input[8] == 'm') &&
-         s.input[9] == ':' {
-        return s.handleSoml(size)
+    } else if data[1] == 'S' || data[1] == 's' {
+      if (data[2] == 'E' || data[2] == 'e') &&
+         (data[3] == 'T' || data[3] == 't') {
+        return s.handleRset(data)
       }
     }
-  } else if s.input[0] == 'V' || s.input[0] == 'v' {
-    if (s.input[1] == 'R' || s.input[1] == 'r') &&
-       (s.input[2] == 'F' || s.input[2] == 'f') &&
-       (s.input[3] == 'Y' || s.input[3] == 'y') {
-      return s.handleVrfy(size)
+  } else if data[0] == 'S' || data[0] == 's' {
+    if len(data) < MinMailLineLength {
+      return s.codeWithVerdict(500)
+    }
+    if data[1] == 'E' || data[1] == 'e' {
+      if (data[2] == 'N' || data[2] == 'n') &&
+         (data[3] == 'D' || data[3] == 'd') &&
+         data[4] == ' ' &&
+         (data[5] == 'F' || data[5] == 'f') &&
+         (data[6] == 'R' || data[6] == 'r') &&
+         (data[7] == 'O' || data[7] == 'o') &&
+         (data[8] == 'M' || data[8] == 'm') &&
+         data[9] == ':' {
+        return s.handleSend(data)
+      }
+    } else if data[1] == 'A' || data[1] == 'a' {
+      if (data[2] == 'M' || data[2] == 'm') &&
+         (data[3] == 'L' || data[3] == 'l') &&
+         data[4] == ' ' &&
+         (data[5] == 'F' || data[5] == 'f') &&
+         (data[6] == 'R' || data[6] == 'r') &&
+         (data[7] == 'O' || data[7] == 'o') &&
+         (data[8] == 'M' || data[8] == 'm') &&
+         data[9] == ':' {
+        return s.handleSaml(data)
+      }
+    } else if data[1] == 'O' || data[1] == 'o' {
+      if (data[2] == 'M' || data[2] == 'm') &&
+         (data[3] == 'L' || data[3] == 'l') &&
+         data[4] == ' ' &&
+         (data[5] == 'F' || data[5] == 'f') &&
+         (data[6] == 'R' || data[6] == 'r') &&
+         (data[7] == 'O' || data[7] == 'o') &&
+         (data[8] == 'M' || data[8] == 'm') &&
+         data[9] == ':' {
+        return s.handleSoml(data)
+      }
+    }
+  } else if data[0] == 'V' || data[0] == 'v' {
+    if (data[1] == 'R' || data[1] == 'r') &&
+       (data[2] == 'F' || data[2] == 'f') &&
+       (data[3] == 'Y' || data[3] == 'y') {
+      return s.handleVrfy(data)
     }
   }
-  return Continue, s.R(500)
+  return s.codeWithVerdict(500)
 }
 
 // Process an AUTH command.
-func (s *SMTPSession) handleAuth(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleAuth(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a DATA command.
-func (s *SMTPSession) handleData(size int) (Verdict, error) {
+func (s *SMTPSession) handleData(data []byte) Verdict {
   if len(s.message.To) < 1 {
-    return Continue, s.respond(554, "no valid recipients given")
+    return s.respondWithVerdict(554, "no valid recipients given")
   }
-  err := s.R(354)
-  if err != nil {
-    return Terminate, err
+  if err := s.respondCode(354); err != nil {
+    log.Error("%s: failed to send response: %v", s.remote, err)
+    return Terminate
   }
   s.state = dataReceived
   body, err := s.readBody()
   if err != nil {
-    return Continue, err
+    log.Error("failed to read body of message: %v", err)
+    return Terminate
   }
   s.message.Body = body
   s.state = bodyReceived
-  return Continue, s.R(250)
+  return s.codeWithVerdict(250)
 }
 
 // Process an EHLO command.
-func (s *SMTPSession) handleEhlo(size int) (Verdict, error) {
+func (s *SMTPSession) handleEhlo(data []byte) Verdict {
   if s.state > bannerSent {
-    return Continue, s.R(503)
+    return s.codeWithVerdict(503)
+  }
+  err := s.respondMulti(250,
+                        []string{s.heloLine(),
+                                 fmt.Sprintf("SIZE %d", MaxMsgSize),
+                                 "PIPELINING",
+                                 "8BITMIME"})
+  if err != nil {
+    return Terminate
   }
   s.state = heloReceived
-  return Continue, s.respondMulti(
-    250,
-    []string{s.heloLine(),
-             fmt.Sprintf("SIZE %d", MaxMsgSize),
-             "PIPELINING",
-             "8BITMIME"})
+  return Continue
 }
 
 // Process an ETRN command.
-func (s *SMTPSession) handleEtrn(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleEtrn(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process an EXPN command.
-func (s *SMTPSession) handleExpn(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleExpn(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a HELO command.
-func (s *SMTPSession) handleHelo(size int) (Verdict, error) {
+func (s *SMTPSession) handleHelo(data []byte) Verdict {
   if s.state > bannerSent {
-    return Continue, s.R(503)
+    return s.codeWithVerdict(503)
   }
   s.state = heloReceived
-  return Continue, s.respond(250, s.heloLine())
+  return s.respondWithVerdict(250, s.heloLine())
 }
 
 // Process a HELP command.
-func (s *SMTPSession) handleHelp(size int) (Verdict, error) {
-  return Continue, s.R(214)
+func (s *SMTPSession) handleHelp(data []byte) Verdict {
+  return s.codeWithVerdict(214)
 }
 
 // Process a MAIL FROM command.
-func (s *SMTPSession) handleMail(size int) (Verdict, error) {
+func (s *SMTPSession) handleMail(data []byte) Verdict {
   if s.state != heloReceived {
-    return Continue, s.R(503)
+    return s.codeWithVerdict(503)
   }
-  from, err := s.extractAddress(0, size)
+  from, err := s.extractAddress(data)
   if err != nil {
-    return Terminate, s.R(501)
+    return s.codeWithVerdict(501)
   }
   s.message.Remote = s.remote
   s.message.From = from
   s.state = mailReceived
-  return Continue, s.R(250)
+  return s.codeWithVerdict(250)
 }
 
 // Process a NOOP command.
-func (s *SMTPSession) handleNoop(size int) (Verdict, error) {
-  return Continue, s.R(250)
+func (s *SMTPSession) handleNoop(data []byte) Verdict {
+  return s.codeWithVerdict(250)
 }
 
 // Process a QUIT command.
-func (s *SMTPSession) handleQuit(size int) (Verdict, error) {
-  err := s.R(221)
-  return Terminate, err
+func (s *SMTPSession) handleQuit(data []byte) Verdict {
+  s.respondCode(221)
+  return Terminate
 }
 
 // Process a RCPT TO command.
-func (s *SMTPSession) handleRcpt(size int) (Verdict, error) {
+func (s *SMTPSession) handleRcpt(data []byte) Verdict {
   if s.state != mailReceived && s.state != rcptReceived {
-    return Continue, s.R(503)
+    return s.codeWithVerdict(503)
   }
-  rcpt, err := s.extractAddress(0, size)
+  rcpt, err := s.extractAddress(data)
   if err != nil {
-    return Continue, s.R(501)
+    return s.codeWithVerdict(501)
   }
   s.message.AddRecipient(rcpt)
   s.state = rcptReceived
-  return Continue, s.R(250)
+  return s.codeWithVerdict(250)
 }
 
 // Process a RSET command.
-func (s *SMTPSession) handleRset(size int) (Verdict, error) {
+func (s *SMTPSession) handleRset(data []byte) Verdict {
   if s.state >= heloReceived {
     s.state = heloReceived
     s.message = NewSMTPMessage()
   }
-  return Continue, s.R(250)
+  return s.codeWithVerdict(250)
 }
 
 // Process a SEND FROM command.
-func (s *SMTPSession) handleSend(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleSend(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a SAML FROM command.
-func (s *SMTPSession) handleSaml(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleSaml(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a SOML FROM command.
-func (s *SMTPSession) handleSoml(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleSoml(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a TURN command.
-func (s *SMTPSession) handleTurn(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleTurn(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
 // Process a VRFY command.
-func (s *SMTPSession) handleVrfy(size int) (Verdict, error) {
-  return Continue, s.R(502)
+func (s *SMTPSession) handleVrfy(data []byte) Verdict {
+  return s.codeWithVerdict(502)
 }
 
-// Format SMTP response line with code and message.
-func (s *SMTPSession) responseLine(code int, sep, message string) []byte {
-  return []byte(fmt.Sprintf("%d%s%s\r\n", code, sep, message))
+// Respond to client, reporting session termination if there was an error
+// writing to the socket.
+func (s *SMTPSession) respondWithVerdict(code int, message string) Verdict {
+  if err := s.respond(code, message); err != nil {
+    log.Error("%s: failed to send response: %v", s.remote, err)
+    return Terminate
+  }
+  return Continue
+}
+
+// Respond to client, reporting session termination if there was an error
+// writing to the socket.
+func (s *SMTPSession) codeWithVerdict(code int) Verdict {
+  if err := s.respondCode(code); err != nil {
+    log.Error("%s: failed to send response: %v", s.remote, err)
+    return Terminate
+  }
+  return Continue
 }
 
 // Write a single-line response to this session.
 func (s *SMTPSession) respond(code int, message string) (err error) {
-  _, err = s.client.Write(s.responseLine(code, " ", message))
+  _, err = s.w.Write(s.responseLine(code, " ", message))
+  return
+}
+
+// Write a single-line response from the ResponseMap for the given code.
+func (s *SMTPSession) respondCode(code int) (err error) {
+  _, err = s.w.Write(ResponseMap[code])
   return
 }
 
@@ -404,7 +420,7 @@ func (s *SMTPSession) respondMulti(code int, messages []string) (err error) {
     if i == len(messages) - 1 {
       sep = " "
     }
-    _, err = s.client.Write(s.responseLine(code, sep, messages[i]))
+    _, err = s.w.Write(s.responseLine(code, sep, messages[i]))
     if err != nil {
       return
     }
@@ -412,28 +428,9 @@ func (s *SMTPSession) respondMulti(code int, messages []string) (err error) {
   return
 }
 
-// Read a single CRLF-terminated line from the client.
-func (s *SMTPSession) readLine() (int, error) {
-  pos := 0
-  for {
-    n, err := s.client.Read(s.input[pos:])
-    if err != nil {
-      return -1, err
-    }
-    pos += n
-    for b := range s.input {
-      if s.input[b] == '\n' {
-        if s.input[b-1] == '\r' {
-          return b + 1, nil
-        }
-        return -1, InvalidSentinel
-      }
-    }
-    if pos + 1 > MaxLineLength {
-      return -1, LineTooLong
-    }
-  }
-  return -1, ReadInterrupted
+// Format SMTP response line with code and message.
+func (s *SMTPSession) responseLine(code int, sep, message string) []byte {
+  return []byte(fmt.Sprintf("%d%s%s\r\n", code, sep, message))
 }
 
 // Read in the <CRLF>.<CRLF>-terminated body of an SMTP message submission.
@@ -442,7 +439,7 @@ func (s *SMTPSession) readBody() (string, error) {
   body := make([]byte, MaxMsgSize)
   pos := 0
   for {
-    n, err := s.client.Read(body[pos:])
+    n, err := s.r.Read(body[pos:])
     if err != nil {
       return "", err
     }
@@ -463,17 +460,17 @@ func (s *SMTPSession) readBody() (string, error) {
 
 // Extract the email address part of an SMTP command line that should
 // contain one (i.e. the stuff between the < and > in MAIL/RCPT commands).
-func (s *SMTPSession) extractAddress(begin, size int) (string, error) {
+func (s *SMTPSession) extractAddress(line []byte) (string, error) {
   start, end := -1, -1
-  for i := begin; i < size + begin; i++ {
-    if s.input[i] == '<' {
+  for i := 0; i < len(line); i++ {
+    if line[i] == '<' {
       start = i
-    } else if s.input[i] == '>' {
+    } else if line[i] == '>' {
       end = i
     }
   }
   if start > -1 && end > -1 && end > start {
-    return string(s.input[start+1:end]), nil
+    return string(line[start+1:end]), nil
   }
   return "", AddressNotFound
 }
