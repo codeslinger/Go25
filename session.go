@@ -13,16 +13,13 @@ import (
 // --- SMTP Session ---------------------------------------------------------
 
 type SMTPSession struct {
-  Remote   *net.TCPAddr
-  From     string
-  Rcpts    []string
-  Body     string
-
+  remote   *net.TCPAddr
   client   io.ReadWriter
   input    []byte
   state    sessionState
   ident    *string
   domain   *string
+  message  *SMTPMessage
 }
 
 type sessionState int
@@ -40,7 +37,6 @@ const (
 var (
   MaxMsgSize        = 16777216  // FIXME: should be in config
   MaxLineLength     = 1024
-  InitialRcptsLen   = 3
   MinCommandLength  = 6
   MinMailLineLength = 14
   MinRcptLineLength = 12
@@ -48,16 +44,13 @@ var (
 )
 
 var (
-  AddressNotFound       = errors.New("could not find email address in command syntax")
-  InShutdown            = errors.New("service shutting down")
-  LineTooLong           = errors.New("command line too long")
-  InvalidSentinel       = errors.New("line not terminated with CRLF")
-  InvalidCommand        = errors.New("invalid SMTP command")
-  InvalidArgument       = errors.New("SMTP command requested should have no arguments")
-  MessageTooLong        = errors.New("Message body was over maximum size allowed")
-  ReadInterrupted       = errors.New("read from client interrupted")
-  SessionClosedByClient = errors.New("session terminated by client")
-  TimeoutError          = errors.New("session timed out")
+  AddressNotFound = errors.New("could not find email address in command syntax")
+  LineTooLong     = errors.New("command line too long")
+  InvalidSentinel = errors.New("line not terminated with CRLF")
+  InvalidCommand  = errors.New("invalid SMTP command")
+  MessageTooLong  = errors.New("Message body was over maximum size allowed")
+  ReadInterrupted = errors.New("read from client interrupted")
+  TimeoutError    = errors.New("session timed out")
 )
 
 var ResponseMap = map[int][]byte {
@@ -90,15 +83,13 @@ func NewSMTPSession(client io.ReadWriter,
                     remoteAddr *net.TCPAddr,
                     ident, domain *string) *SMTPSession {
   return &SMTPSession{
-    Remote:   remoteAddr,
-    From:     "",
-    Rcpts:    make([]string, 0),
-    Body:     "",
+    remote:   remoteAddr,
     client:   client,
     input:    make([]byte, InputBufSize),
     state:    connected,
     ident:    ident,
     domain:   domain,
+    message:  NewSMTPMessage(),
   }
 }
 
@@ -266,7 +257,7 @@ func (s *SMTPSession) handleAuth(size int) (Verdict, error) {
 
 // Process a DATA command.
 func (s *SMTPSession) handleData(size int) (Verdict, error) {
-  if len(s.Rcpts) < 1 {
+  if len(s.message.To) < 1 {
     return Continue, s.respond(554, "no valid recipients given")
   }
   err := s.R(354)
@@ -274,10 +265,11 @@ func (s *SMTPSession) handleData(size int) (Verdict, error) {
     return Terminate, err
   }
   s.state = dataReceived
-  err = s.readBody()
+  body, err := s.readBody()
   if err != nil {
     return Continue, err
   }
+  s.message.Body = body
   s.state = bodyReceived
   return Continue, s.R(250)
 }
@@ -329,7 +321,8 @@ func (s *SMTPSession) handleMail(size int) (Verdict, error) {
   if err != nil {
     return Terminate, s.R(501)
   }
-  s.From = from
+  s.message.Remote = s.remote
+  s.message.From = from
   s.state = mailReceived
   return Continue, s.R(250)
 }
@@ -354,7 +347,7 @@ func (s *SMTPSession) handleRcpt(size int) (Verdict, error) {
   if err != nil {
     return Continue, s.R(501)
   }
-  s.Rcpts = append(s.Rcpts, rcpt)
+  s.message.AddRecipient(rcpt)
   s.state = rcptReceived
   return Continue, s.R(250)
 }
@@ -363,9 +356,7 @@ func (s *SMTPSession) handleRcpt(size int) (Verdict, error) {
 func (s *SMTPSession) handleRset(size int) (Verdict, error) {
   if s.state >= heloReceived {
     s.state = heloReceived
-    s.From = ""
-    s.Rcpts = make([]string, 0)
-    s.Body = ""
+    s.message = NewSMTPMessage()
   }
   return Continue, s.R(250)
 }
@@ -446,14 +437,14 @@ func (s *SMTPSession) readLine() (int, error) {
 }
 
 // Read in the <CRLF>.<CRLF>-terminated body of an SMTP message submission.
-func (s *SMTPSession) readBody() error {
+func (s *SMTPSession) readBody() (string, error) {
   // TODO: spill message to disk if its over a certain size
   body := make([]byte, MaxMsgSize)
   pos := 0
   for {
     n, err := s.client.Read(body[pos:])
     if err != nil {
-      return err
+      return "", err
     }
     pos += n
     if body[pos-1] == '\n' &&
@@ -464,11 +455,10 @@ func (s *SMTPSession) readBody() error {
       break
     }
     if pos >= MaxMsgSize {
-      return MessageTooLong
+      return "", MessageTooLong
     }
   }
-  s.Body = string(body[0:pos-5])
-  return nil
+  return string(body[0:pos-5]), nil
 }
 
 // Extract the email address part of an SMTP command line that should
@@ -498,6 +488,6 @@ func (s *SMTPSession) banner() string {
 
 // Format line for greeting clients in response to HELO/EHLO command.
 func (s *SMTPSession) heloLine() string {
-  return fmt.Sprintf("%s Hello [%s]", *s.domain, s.Remote.IP)
+  return fmt.Sprintf("%s Hello [%s]", *s.domain, s.remote.IP)
 }
 
