@@ -11,7 +11,6 @@ type TCPService interface {
   SetClientOptions(*net.TCPConn) error
   Handle(*net.TCPConn)
   Addr() string
-  Exited() chan int
   Shutdown()
 }
 

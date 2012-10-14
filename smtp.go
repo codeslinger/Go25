@@ -27,12 +27,12 @@ const (
 )
 
 // Create a new SMTP server instance bound to the given TCP address.
-func NewSMTPService(addr, domain string) *SMTPService {
+func NewSMTPService(addr, domain string, exited chan int) *SMTPService {
   return &SMTPService{
     ServerIdent:    DefaultIdent,
     ServingDomain:  domain,
     addr:           addr,
-    exited:         make(chan int, 1),
+    exited:         exited,
     draining:       false,
   }
 }
@@ -40,11 +40,6 @@ func NewSMTPService(addr, domain string) *SMTPService {
 // Returns TCP address on which this server is listening.
 func (s *SMTPService) Addr() string {
   return s.addr
-}
-
-// Returns channel indicating when this server has exited.
-func (s *SMTPService) Exited() chan int {
-  return s.exited
 }
 
 // Shut down this SMTP server.
