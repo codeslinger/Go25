@@ -18,11 +18,13 @@ type TCPService interface {
 func RunTCP(t TCPService) {
   localAddr, err := net.ResolveTCPAddr("tcp", t.Addr())
   if err != nil {
-    log.Critical("could not resolve bind address: %s", t.Addr())
+    log.Error("could not resolve bind address: %s", t.Addr())
+    return
   }
   l, err := net.ListenTCP("tcp", localAddr)
   if err != nil {
-    log.Critical("failed to bind to local address %s", localAddr)
+    log.Error("failed to bind to local address %s", localAddr)
+    return
   }
   defer l.Close()
 
