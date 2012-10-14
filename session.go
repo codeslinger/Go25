@@ -45,11 +45,7 @@ var (
 
 var (
   AddressNotFound = errors.New("could not find email address in command syntax")
-  LineTooLong     = errors.New("command line too long")
-  InvalidSentinel = errors.New("line not terminated with CRLF")
-  InvalidCommand  = errors.New("invalid SMTP command")
   MessageTooLong  = errors.New("Message body was over maximum size allowed")
-  ReadInterrupted = errors.New("read from client interrupted")
   TimeoutError    = errors.New("session timed out")
 )
 
