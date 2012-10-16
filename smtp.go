@@ -63,10 +63,7 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     conn.Write(ResponseMap[421])
     return
   }
-  session := NewSMTPSession(conn,
-                            conn.RemoteAddr().(*net.TCPAddr),
-                            &s.ServerIdent,
-                            &s.ServingDomain)
+  session := NewSMTPSession(conn, s)
   if verdict := session.Greet(); verdict == Terminate {
     return
   }

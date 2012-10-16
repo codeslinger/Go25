@@ -6,7 +6,6 @@ import (
   "errors"
   "fmt"
   "github.com/codeslinger/log"
-  "io"
   "net"
   "time"
 )
@@ -14,19 +13,18 @@ import (
 // --- SMTP Session ---------------------------------------------------------
 
 type SMTPSession struct {
+  conn     *net.TCPConn
   r        *bufio.Reader
-  w        io.Writer
   remote   *net.TCPAddr
   state    sessionState
-  ident    *string
-  domain   *string
+  service  *SMTPService
   message  *SMTPMessage
 }
 
 type sessionState int
 
 const (
-  connected = iota
+  connected sessionState = iota
   bannerSent
   heloReceived
   mailReceived
@@ -37,6 +35,7 @@ const (
 
 var (
   MaxMsgSize        = 16777216  // FIXME: should be in config
+  MaxIdleSeconds    = 120
   MaxLineLength     = 1024
   MinCommandLength  = 6
   MinMailLineLength = 14
@@ -48,6 +47,8 @@ var (
   MessageTooLong  = errors.New("Message body was over maximum size allowed")
   TimeoutError    = errors.New("session timed out")
 )
+
+var sizeLine = fmt.Sprintf("SIZE %d", MaxMsgSize)
 
 var ResponseMap = map[int][]byte {
   211: []byte("211 System status, or system help reply\r\n"),
@@ -75,17 +76,14 @@ var ResponseMap = map[int][]byte {
 }
 
 // Create a new SMTP session record.
-func NewSMTPSession(client io.ReadWriter,
-                    remoteAddr *net.TCPAddr,
-                    ident, domain *string) *SMTPSession {
+func NewSMTPSession(conn *net.TCPConn, service *SMTPService) *SMTPSession {
   return &SMTPSession{
-    r:        bufio.NewReaderSize(client, MaxLineLength),
-    w:        client,
-    remote:   remoteAddr,
+    r:        bufio.NewReaderSize(conn, MaxLineLength),
+    conn:     conn,
+    remote:   conn.RemoteAddr().(*net.TCPAddr),
     state:    connected,
-    ident:    ident,
-    domain:   domain,
-    message:  NewSMTPMessage(),
+    service:  service,
+    message:  nil,
   }
 }
 
@@ -97,9 +95,9 @@ func (s *SMTPSession) Greet() Verdict {
 
 // Read, process and respond to a SMTP command(s) from the client.
 func (s *SMTPSession) Process() Verdict {
-  data, err := s.r.ReadBytes('\n')
+  data, err := s.readLine()
   if err != nil {
-    s.codeWithVerdict(500)
+    s.codeWithVerdict(221)
     return Terminate
   }
   if len(data) < MinCommandLength {
@@ -248,7 +246,6 @@ func (s *SMTPSession) handleData(data []byte) Verdict {
     return s.respondWithVerdict(554, "no valid recipients given")
   }
   if err := s.respondCode(354); err != nil {
-    log.Error("%s: failed to send response: %v", s.remote, err)
     return Terminate
   }
   s.state = dataReceived
@@ -269,7 +266,7 @@ func (s *SMTPSession) handleEhlo(data []byte) Verdict {
   }
   err := s.respondMulti(250,
                         []string{s.heloLine(),
-                                 fmt.Sprintf("SIZE %d", MaxMsgSize),
+                                 sizeLine,
                                  "PIPELINING",
                                  "8BITMIME"})
   if err != nil {
@@ -312,6 +309,7 @@ func (s *SMTPSession) handleMail(data []byte) Verdict {
   if err != nil {
     return s.codeWithVerdict(501)
   }
+  s.message = NewSMTPMessage()
   s.message.Remote = s.remote
   s.message.From = from
   s.state = mailReceived
@@ -398,15 +396,13 @@ func (s *SMTPSession) codeWithVerdict(code int) Verdict {
 }
 
 // Write a single-line response to this session.
-func (s *SMTPSession) respond(code int, message string) (err error) {
-  _, err = s.w.Write(s.responseLine(code, " ", message))
-  return
+func (s *SMTPSession) respond(code int, message string) error {
+  return s.send(s.responseLine(code, " ", message))
 }
 
 // Write a single-line response from the ResponseMap for the given code.
-func (s *SMTPSession) respondCode(code int) (err error) {
-  _, err = s.w.Write(ResponseMap[code])
-  return
+func (s *SMTPSession) respondCode(code int) error {
+  return s.send(ResponseMap[code])
 }
 
 // Write a multi-line response to this session.
@@ -416,7 +412,7 @@ func (s *SMTPSession) respondMulti(code int, messages []string) (err error) {
     if i == len(messages) - 1 {
       sep = " "
     }
-    _, err = s.w.Write(s.responseLine(code, sep, messages[i]))
+    err = s.send(s.responseLine(code, sep, messages[i]))
     if err != nil {
       return
     }
@@ -435,7 +431,7 @@ func (s *SMTPSession) readBody() (string, error) {
   body := make([]byte, MaxMsgSize)
   pos := 0
   for {
-    n, err := s.r.Read(body[pos:])
+    n, err := s.slurp(body[pos:])
     if err != nil {
       return "", err
     }
@@ -474,13 +470,64 @@ func (s *SMTPSession) extractAddress(line []byte) (string, error) {
 // Format line for greeting clients at initial connect time.
 func (s *SMTPSession) banner() string {
   return fmt.Sprintf("%s %s Service ready at %s",
-                     *s.domain,
-                     *s.ident,
+                     s.service.ServingDomain,
+                     s.service.ServerIdent,
                      time.Now().Format(time.RFC1123Z))
 }
 
 // Format line for greeting clients in response to HELO/EHLO command.
 func (s *SMTPSession) heloLine() string {
-  return fmt.Sprintf("%s Hello [%s]", *s.domain, s.remote.IP)
+  return fmt.Sprintf("%s Hello [%s]", s.service.ServingDomain, s.remote.IP)
+}
+
+// Read a single line from the client.
+func (s *SMTPSession) readLine() ([]byte, error) {
+  if err := s.conn.SetReadDeadline(s.timeout()); err != nil {
+    return nil, err
+  }
+  data, err := s.r.ReadBytes('\n')
+  if err != nil {
+    s.err("error reading from client", err)
+    return nil, err
+  }
+  return data, nil
+}
+
+// Read input from client, up to size of given buffer.
+func (s *SMTPSession) slurp(buf []byte) (int, error) {
+  if err := s.conn.SetReadDeadline(s.timeout()); err != nil {
+    return -1, err
+  }
+  n, err := s.r.Read(buf)
+  if err != nil {
+    s.err("error reading from client", err)
+    return -1, err
+  }
+  return n, nil
+}
+
+// Send data to client. Returns an error if the write failed to complete in
+// MaxIdleSeconds seconds.
+func (s *SMTPSession) send(data []byte) (err error) {
+  if err = s.conn.SetWriteDeadline(s.timeout()); err != nil {
+    return
+  }
+  _, err = s.conn.Write(data)
+  if err != nil {
+    s.err("error writing to client", err)
+    return err
+  }
+  return nil
+}
+
+// Returns time after which the session should be considered timed out due
+// to inactivity.
+func (s *SMTPSession) timeout() time.Time {
+  return time.Now().Add(time.Second * time.Duration(MaxIdleSeconds))
+}
+
+// Log an error for this session.
+func (s *SMTPSession) err(message string, err error) {
+  log.Warn("%s: %s: %v", s.remote, message, err)
 }
 
