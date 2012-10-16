@@ -264,12 +264,7 @@ func (s *SMTPSession) handleEhlo(data []byte) Verdict {
   if s.state > bannerSent {
     return s.codeWithVerdict(503)
   }
-  err := s.respondMulti(250,
-                        []string{s.heloLine(),
-                                 sizeLine,
-                                 "PIPELINING",
-                                 "8BITMIME"})
-  if err != nil {
+  if err := s.respondMulti(250, []string{s.heloLine(), sizeLine, "PIPELINING", "8BITMIME"}); err != nil {
     return Terminate
   }
   s.state = heloReceived
