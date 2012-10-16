@@ -242,7 +242,7 @@ func (s *SMTPSession) handleAuth(data []byte) Verdict {
 
 // Process a DATA command.
 func (s *SMTPSession) handleData(data []byte) Verdict {
-  if len(s.message.To) < 1 {
+  if s.message.To.Len() < 1 {
     return s.respondWithVerdict(554, "no valid recipients given")
   }
   if err := s.respondCode(354); err != nil {
@@ -309,8 +309,7 @@ func (s *SMTPSession) handleMail(data []byte) Verdict {
   if err != nil {
     return s.codeWithVerdict(501)
   }
-  s.message = NewSMTPMessage()
-  s.message.Remote = s.remote
+  s.message = NewSMTPMessage(s.remote)
   s.message.From = from
   s.state = mailReceived
   return s.codeWithVerdict(250)
@@ -336,7 +335,7 @@ func (s *SMTPSession) handleRcpt(data []byte) Verdict {
   if err != nil {
     return s.codeWithVerdict(501)
   }
-  s.message.AddRecipient(rcpt)
+  s.message.To.PushBack(rcpt)
   s.state = rcptReceived
   return s.codeWithVerdict(250)
 }
@@ -345,7 +344,7 @@ func (s *SMTPSession) handleRcpt(data []byte) Verdict {
 func (s *SMTPSession) handleRset(data []byte) Verdict {
   if s.state >= heloReceived {
     s.state = heloReceived
-    s.message = NewSMTPMessage()
+    s.message = NewSMTPMessage(s.remote)
   }
   return s.codeWithVerdict(250)
 }

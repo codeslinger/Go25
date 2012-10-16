@@ -1,7 +1,10 @@
 // vim:set ts=2 sw=2 et ai ft=go:
 package main
 
-import "net"
+import (
+  "container/list"
+  "net"
+)
 
 // --- SMTP message submission ----------------------------------------------
 
@@ -9,22 +12,17 @@ import "net"
 type SMTPMessage struct {
   Remote *net.TCPAddr
   From   string
-  To     []string
+  To     *list.List
   Body   string
 }
 
 // Create a new record for an SMTP message submission.
-func NewSMTPMessage() *SMTPMessage {
+func NewSMTPMessage(addr *net.TCPAddr) *SMTPMessage {
   return &SMTPMessage{
-    Remote: nil,
+    Remote: addr,
     From:   "",
-    To:     make([]string, 0),
+    To:     list.New(),
     Body:   "",
   }
-}
-
-// Add a recipient to this SMTP message submission.
-func (m *SMTPMessage) AddRecipient(rcpt string) {
-  m.To = append(m.To, rcpt)
 }
 
