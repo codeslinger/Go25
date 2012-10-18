@@ -12,9 +12,8 @@ import (
 var DefaultIdent = "ESMTP Go25"
 
 type SMTPService struct {
-  ServerIdent   string
-  ServingDomain string
-  addr          string
+  cfg           Config
+  addr          *net.TCPAddr
   exited        chan int
   draining      bool
 }
@@ -27,18 +26,17 @@ const (
 )
 
 // Create a new SMTP server instance bound to the given TCP address.
-func NewSMTPService(addr, domain string, exited chan int) *SMTPService {
+func NewSMTPService(c Config, exited chan int) *SMTPService {
   return &SMTPService{
-    ServerIdent:    DefaultIdent,
-    ServingDomain:  domain,
-    addr:           addr,
-    exited:         exited,
-    draining:       false,
+    cfg:      c,
+    addr:     c.ListenLocal(),
+    exited:   exited,
+    draining: false,
   }
 }
 
 // Returns TCP address on which this server is listening.
-func (s *SMTPService) Addr() string {
+func (s *SMTPService) Addr() *net.TCPAddr {
   return s.addr
 }
 
@@ -63,7 +61,7 @@ func (s *SMTPService) Handle(conn *net.TCPConn) {
     conn.Write(ResponseMap[421])
     return
   }
-  session := NewSMTPSession(conn, s)
+  session := NewSMTPSession(conn, s.cfg)
   if verdict := session.Greet(); verdict == Terminate {
     return
   }

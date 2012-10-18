@@ -17,7 +17,7 @@ type SMTPSession struct {
   r        *bufio.Reader
   remote   *net.TCPAddr
   state    sessionState
-  service  *SMTPService
+  cfg      Config
   message  *SMTPMessage
 }
 
@@ -76,13 +76,13 @@ var ResponseMap = map[int][]byte {
 }
 
 // Create a new SMTP session record.
-func NewSMTPSession(conn *net.TCPConn, service *SMTPService) *SMTPSession {
+func NewSMTPSession(conn *net.TCPConn, cfg Config) *SMTPSession {
   return &SMTPSession{
     r:        bufio.NewReaderSize(conn, MaxLineLength),
     conn:     conn,
     remote:   conn.RemoteAddr().(*net.TCPAddr),
     state:    connected,
-    service:  service,
+    cfg:      cfg,
     message:  nil,
   }
 }
@@ -463,15 +463,15 @@ func (s *SMTPSession) extractAddress(line []byte) (string, error) {
 
 // Format line for greeting clients at initial connect time.
 func (s *SMTPSession) banner() string {
-  return fmt.Sprintf("%s %s Service ready at %s",
-                     s.service.ServingDomain,
-                     s.service.ServerIdent,
+  return fmt.Sprintf("%s ESMTP %s Service ready at %s",
+                     s.cfg.ServingDomain(),
+                     s.cfg.SoftwareIdent(),
                      time.Now().Format(time.RFC1123Z))
 }
 
 // Format line for greeting clients in response to HELO/EHLO command.
 func (s *SMTPSession) heloLine() string {
-  return fmt.Sprintf("%s Hello [%s]", s.service.ServingDomain, s.remote.IP)
+  return fmt.Sprintf("%s Hello [%s]", s.cfg.ServingDomain(), s.remote.IP)
 }
 
 // Read a single line from the client.
