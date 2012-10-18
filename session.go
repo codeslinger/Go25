@@ -33,9 +33,7 @@ const (
   bodyReceived
 )
 
-var (
-  MaxMsgSize        = 16777216  // FIXME: should be in config
-  MaxIdleSeconds    = 120
+const (
   MaxLineLength     = 1024
   MinCommandLength  = 6
   MinMailLineLength = 14
@@ -47,8 +45,6 @@ var (
   MessageTooLong  = errors.New("Message body was over maximum size allowed")
   TimeoutError    = errors.New("session timed out")
 )
-
-var sizeLine = fmt.Sprintf("SIZE %d", MaxMsgSize)
 
 var ResponseMap = map[int][]byte {
   211: []byte("211 System status, or system help reply\r\n"),
@@ -264,7 +260,10 @@ func (s *SMTPSession) handleEhlo(data []byte) Verdict {
   if s.state > bannerSent {
     return s.codeWithVerdict(503)
   }
-  if err := s.respondMulti(250, []string{s.heloLine(), sizeLine, "PIPELINING", "8BITMIME"}); err != nil {
+  if err := s.respondMulti(250, []string{s.heloLine(),
+                                         fmt.Sprintf("SIZE %d", s.cfg.MaxMsgSize()),
+                                         "PIPELINING",
+                                         "8BITMIME"}); err != nil {
     return Terminate
   }
   s.state = heloReceived
@@ -422,7 +421,7 @@ func (s *SMTPSession) responseLine(code int, sep, message string) []byte {
 // Read in the <CRLF>.<CRLF>-terminated body of an SMTP message submission.
 func (s *SMTPSession) readBody() (string, error) {
   // TODO: spill message to disk if its over a certain size
-  body := make([]byte, MaxMsgSize)
+  body := make([]byte, s.cfg.MaxMsgSize())
   pos := 0
   for {
     n, err := s.slurp(body[pos:])
@@ -437,7 +436,7 @@ func (s *SMTPSession) readBody() (string, error) {
        body[pos-5] == '\r' {
       break
     }
-    if pos >= MaxMsgSize {
+    if pos >= s.cfg.MaxMsgSize() {
       return "", MessageTooLong
     }
   }
@@ -463,10 +462,9 @@ func (s *SMTPSession) extractAddress(line []byte) (string, error) {
 
 // Format line for greeting clients at initial connect time.
 func (s *SMTPSession) banner() string {
-  return fmt.Sprintf("%s ESMTP %s Service ready at %s",
+  return fmt.Sprintf("%s ESMTP %s Service ready",
                      s.cfg.ServingDomain(),
-                     s.cfg.SoftwareIdent(),
-                     time.Now().Format(time.RFC1123Z))
+                     s.cfg.SoftwareIdent())
 }
 
 // Format line for greeting clients in response to HELO/EHLO command.
@@ -517,7 +515,7 @@ func (s *SMTPSession) send(data []byte) (err error) {
 // Returns time after which the session should be considered timed out due
 // to inactivity.
 func (s *SMTPSession) timeout() time.Time {
-  return time.Now().Add(time.Second * time.Duration(MaxIdleSeconds))
+  return time.Now().Add(time.Second * time.Duration(s.cfg.MaxIdleSecs()))
 }
 
 // Log an error for this session.

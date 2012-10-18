@@ -17,28 +17,52 @@ import (
 
 type Config interface {
   ListenLocal()   *net.TCPAddr
+  MaxIdleSecs()   int
+  MaxMsgSize()    int
   ServingDomain() string
   SoftwareIdent() string
   Metrics()       metrics.Registry
 }
 
 type config struct {
-  listenAddr          *net.TCPAddr
   domain              string
   ident               string
+  listenAddr          *net.TCPAddr
   loglevel            log.Level
-  registry            metrics.Registry
+  maxIdleSecs         int
+  maxMsgSize          int
   memStatsRefreshSecs int
+  registry            metrics.Registry
 }
 
-var defaultListenAddr string = "0.0.0.0:1025"
-var defaultSoftwareIdent string = "Go25"
-var defaultMemStatsRefreshSecs int = 10
-var defaultLogLevel log.Level = log.TRACE
+const (
+  defaultListenAddr          = "0.0.0.0:1025"
+  defaultSoftwareIdent       = "Go25"
+  defaultMemStatsRefreshSecs = 10
+  defaultLogLevel            = log.TRACE
+  defaultMaxIdleSecs         = 120
+  defaultMaxMsgSize          = 16777216
+)
 
 // Return the local address on which this SMTP service is to listen.
 func (c *config) ListenLocal() *net.TCPAddr {
   return c.listenAddr
+}
+
+// Return the timeout at which a session is considered idle and should be
+// terminated, in seconds.
+func (c *config) MaxIdleSecs() int {
+  return c.maxIdleSecs
+}
+
+// Return the maximum size of a message allowed, in bytes.
+func (c *config) MaxMsgSize() int {
+  return c.maxMsgSize
+}
+
+// Return the registry of metrics for this server instance.
+func (c *config) Metrics() metrics.Registry {
+  return c.registry
 }
 
 // Return the domain from which this SMTP service runs.
@@ -51,18 +75,16 @@ func (c *config) SoftwareIdent() string {
   return c.ident
 }
 
-// Return the registry of metrics for this server instance.
-func (c *config) Metrics() metrics.Registry {
-  return c.registry
-}
-
 func (c *config) String() string {
-  return fmt.Sprintf("listen=%s domain=%s ident='%s' log=%s statsrefresh=%ds",
-                     c.listenAddr,
-                     c.domain,
-                     c.ident,
-                     c.loglevel,
-                     c.memStatsRefreshSecs)
+  return fmt.Sprintf(
+    "listen=%s domain=%s ident='%s' log=%s maxidle=%ds maxmsg=%dB statsrefresh=%ds",
+    c.listenAddr,
+    c.domain,
+    c.ident,
+    c.loglevel,
+    c.maxIdleSecs,
+    c.maxMsgSize,
+    c.memStatsRefreshSecs)
 }
 
 // Return a configuration record populated from the given file. If the file
@@ -108,6 +130,8 @@ func (c *config) setDefaults() (err error) {
   c.ident = defaultSoftwareIdent
   c.memStatsRefreshSecs = defaultMemStatsRefreshSecs
   c.loglevel = defaultLogLevel
+  c.maxIdleSecs = defaultMaxIdleSecs
+  c.maxMsgSize = defaultMaxMsgSize
   metrics.RegisterRuntimeMemStats(c.registry)
   go c.memStatsRefresh()
   return
@@ -169,13 +193,29 @@ func (c *config) parseLine(line string, idx int) (err error) {
     if err != nil {
       return errors.New(fmt.Sprintf("line %d: unknown log level ('%s'): %v", idx, argument, err))
     }
+  case "maxidle":
+    c.maxIdleSecs, err = strconv.Atoi(argument)
+    if err != nil {
+      return errors.New(fmt.Sprintf("line %d: invalid argument to 'maxidle' ('%s'): %v", idx, argument, err))
+    }
+    if c.maxIdleSecs < 1 {
+      return errors.New(fmt.Sprintf("line %d: 'maxidle' value cannot be <1 second", idx))
+    }
+  case "maxmsgsize":
+    c.maxMsgSize, err = strconv.Atoi(argument)
+    if err != nil {
+      return errors.New(fmt.Sprintf("line %d: invalid argument to 'maxmsgsize' ('%s'): %v", idx, argument, err))
+    }
+    if c.maxMsgSize < 1 {
+      return errors.New(fmt.Sprintf("line %d: 'maxmsgsize' value cannot be <1 byte", idx))
+    }
   case "statsrefresh":
     c.memStatsRefreshSecs, err = strconv.Atoi(argument)
     if err != nil {
       return errors.New(fmt.Sprintf("line %d: invalid argument to 'statsrefresh' ('%s'): %v", idx, argument, err))
     }
     if c.memStatsRefreshSecs < 1 {
-      return errors.New(fmt.Sprintf("line %d: 'statsrefresh' interval cannot be <1 sec", idx))
+      return errors.New(fmt.Sprintf("line %d: 'statsrefresh' interval cannot be <1 second", idx))
     }
   default:
     return errors.New(fmt.Sprintf("line %d: unrecognized directive: %s", idx, directive))
