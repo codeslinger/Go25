@@ -10,6 +10,7 @@ import (
   "io"
   "net"
   "os"
+  "runtime"
   "strconv"
   "strings"
   "time"
@@ -22,6 +23,7 @@ type Config interface {
   ServingDomain() string
   SoftwareIdent() string
   Metrics()       metrics.Registry
+  Cores()         int
 }
 
 type config struct {
@@ -33,6 +35,7 @@ type config struct {
   maxMsgSize          int
   memStatsRefreshSecs int
   registry            metrics.Registry
+  cores               int
 }
 
 const (
@@ -75,16 +78,22 @@ func (c *config) SoftwareIdent() string {
   return c.ident
 }
 
+// Return the number of CPU cores to use.
+func (c *config) Cores() int {
+  return c.cores
+}
+
 func (c *config) String() string {
   return fmt.Sprintf(
-    "listen=%s domain=%s ident='%s' log=%s maxidle=%ds maxmsg=%dB statsrefresh=%ds",
+    "listen=%s domain=%s ident='%s' log=%s maxidle=%ds maxmsg=%dB statsrefresh=%ds cores=%d",
     c.listenAddr,
     c.domain,
     c.ident,
     c.loglevel,
     c.maxIdleSecs,
     c.maxMsgSize,
-    c.memStatsRefreshSecs)
+    c.memStatsRefreshSecs,
+    c.cores)
 }
 
 // Return a configuration record populated from the given file. If the file
@@ -132,6 +141,7 @@ func (c *config) setDefaults() (err error) {
   c.loglevel = defaultLogLevel
   c.maxIdleSecs = defaultMaxIdleSecs
   c.maxMsgSize = defaultMaxMsgSize
+  c.cores = runtime.NumCPU()
   metrics.RegisterRuntimeMemStats(c.registry)
   go c.memStatsRefresh()
   return
@@ -171,6 +181,14 @@ func (c *config) parseLine(line string, idx int) (err error) {
   directive := strings.Trim(parts[0], " ")
   argument := strings.Trim(parts[1], " ")
   switch strings.ToLower(directive) {
+  case "cores":
+    if len(argument) == 0 {
+      return errors.New(fmt.Sprintf("line %d: argument to 'cores' cannot be blank", idx))
+    }
+    c.cores, err = strconv.Atoi(argument)
+    if err != nil {
+      return errors.New(fmt.Sprintf("line %d: malformed integer: %s", idx, argument))
+    }
   case "domain":
     if len(argument) == 0 {
       return errors.New(fmt.Sprintf("line %d: argument to 'domain' cannot be blank", idx))

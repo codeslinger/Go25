@@ -25,7 +25,7 @@ func main() {
     return
   }
   log.Info("loaded config: %s", cfg)
-  runtime.GOMAXPROCS(runtime.NumCPU())
+  runtime.GOMAXPROCS(cfg.Cores())
   exitChan := trapSignals()
   go RunTCP(NewSMTPService(cfg, exitChan))
   <-exitChan
