@@ -247,7 +247,7 @@ func (c *config) setListenAddr(addr string) (err error) {
 }
 
 func (c *config) memStatsRefresh() {
-	metrics.CaptureRuntimeMemStats(c.registry, true)
+	metrics.CaptureRuntimeMemStats(c.registry, time.Second)
 	time.Sleep(time.Duration(int64(1e9) * int64(c.memStatsRefreshSecs)))
 }
 
